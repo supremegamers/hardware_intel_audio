@@ -53,7 +53,7 @@ LOCAL_PROPRIETARY_MODULE := true
 
 LOCAL_HEADER_LIBRARIES += libhardware_headers
 
-LOCAL_MODULE := audio.primary.$(TARGET_BOARD_PLATFORM)
+LOCAL_MODULE := audio.primary.x86
 
 LOCAL_MODULE_RELATIVE_PATH := hw
 

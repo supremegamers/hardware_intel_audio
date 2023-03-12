@@ -50,7 +50,7 @@ LOCAL_CFLAGS :=\
 LOCAL_SHARED_LIBRARIES := liblog libcutils libtinyalsa
 
 LOCAL_PROPRIETARY_MODULE := true
-LOCAL_MODULE := audio.hdmi.$(TARGET_BOARD_PLATFORM)
+LOCAL_MODULE := audio.hdmi.x86
 LOCAL_MODULE_TAGS := optional
 #LOCAL_CFLAGS += -Werror
 
