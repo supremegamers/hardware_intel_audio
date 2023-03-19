@@ -46,6 +46,10 @@
 #include <audio_utils/resampler.h>
 #include <audio_route/audio_route.h>
 
+#define GET_PCM_CARD_NUMBER(temp_card)  (((temp_card = get_pcm_card("PCH"))!=-1? temp_card:\
+    ((temp_card = get_pcm_card("Intel"))!=-1? temp_card:\
+    (temp_card = get_pcm_card("sofhdadsp")))))
+
 #define PCM_CARD 0
 #define PCM_CARD_DEFAULT 0
 #define PCM_DEVICE 0
@@ -64,6 +68,12 @@
 #define AUDIO_BT_DRIVER_NAME         "btaudiosource"
 #define SAMPLE_SIZE_IN_BYTES          2
 #define SAMPLE_SIZE_IN_BYTES_STEREO   4
+
+#define NANOS_PER_MICROSECOND  ((int64_t)1000)
+#define NANOS_PER_MILLISECOND  (NANOS_PER_MICROSECOND * 1000)
+#define MICROS_PER_MILLISECOND 1000
+#define MILLIS_PER_SECOND      1000
+#define NANOS_PER_SECOND       (NANOS_PER_MILLISECOND * MILLIS_PER_SECOND)
 
 //#define DEBUG_PCM_DUMP
 
@@ -175,8 +185,22 @@ struct stream_in {
     struct audio_config req_config;
     bool unavailable;
     bool standby;
-
+    unsigned int frames_read;
+    uint64_t timestamp_nsec;
     struct audio_device *dev;
+};
+
+/* 'bytes' are the number of bytes written to audio FIFO, for which 'timestamp' is valid.
+ * 'available' is the number of frames available to read (for input) or yet to be played
+ * (for output) frames in the PCM buffer.
+ * timestamp and available are updated by pcm_get_htimestamp(), so they use the same
+ * datatypes as the corresponding arguments to that function. */
+
+struct aec_info {
+    struct timespec timestamp;
+    uint64_t timestamp_usec;
+    unsigned int available;
+    size_t bytes;
 };
 
 static uint32_t out_get_sample_rate(const struct audio_stream *stream);
@@ -185,6 +209,9 @@ static audio_format_t out_get_format(const struct audio_stream *stream);
 static uint32_t in_get_sample_rate(const struct audio_stream *stream);
 static size_t in_get_buffer_size(const struct audio_stream *stream);
 static audio_format_t in_get_format(const struct audio_stream *stream);
+static int getCapturePosition(const struct audio_stream_in *stream, int64_t* frames, int64_t* time1);
+static inline int64_t audio_utils_ns_from_timespec(const struct timespec *ts);
+static int get_pcm_timestamp(struct pcm* pcm, uint32_t sample_rate, struct aec_info* info, bool isOutput);
 
 static void select_devices(struct audio_device *adev)
 {
@@ -251,13 +278,13 @@ static int get_pcm_card(const char* name)
 
         written = readlink(id_filepath, number_filepath, sizeof(number_filepath));
         if (written < 0) {
-            ALOGE("Sound card %s does not exist - setting default", name);
-                return 0;
+            ALOGE("Sound card %s does not exist\n", name);
+            return -1;
         } else if (written >= (ssize_t)sizeof(id_filepath)) {
-            ALOGE("Sound card %s name is too long - setting default", name);
-            return 0;
+            ALOGE("Sound card %s name is too long - setting default \n", name);
+            return -1;
         }
-
+        ALOGI("Sound card %s exists\n", name);
         return atoi(number_filepath + 4);
 }
 
@@ -706,6 +733,24 @@ static int out_get_presentation_position(const struct audio_stream_out *stream,
     return ret;
 }
 
+static int getCapturePosition(const struct audio_stream_in *stream, int64_t* frames, int64_t* time1){
+    if (stream == NULL || frames == NULL || time1 == NULL) {
+        return -EINVAL;
+     }
+    struct stream_in* in = (struct stream_in*)stream;
+
+    *frames = in->frames_read;
+    *time1 = in->timestamp_nsec;
+    ALOGV("%s: frames_read: %d, timestamp (nsec): %" PRIu64, __func__, in->frames_read, *time1);
+
+    return 0;
+}
+
+static inline int64_t audio_utils_ns_from_timespec(const struct timespec *ts)
+{
+	    return ts->tv_sec * 1000000000LL + ts->tv_nsec;
+}
+
 static int out_add_audio_effect(const struct audio_stream *stream __unused, effect_handle_t effect __unused)
 {
     ALOGV("out_add_audio_effect: %p", effect);
@@ -880,6 +925,40 @@ static int in_set_gain(struct audio_stream_in *stream __unused, float gain __unu
     return 0;
 }
 
+static void timestamp_adjust(struct timespec* ts, ssize_t frames, uint32_t sampling_rate) {
+    /* This function assumes the adjustment (in nsec) is less than the max value of long,
+     * which for 32-bit long this is 2^31 * 1e-9 seconds, slightly over 2 seconds.
+     * For 64-bit long it is  9e+9 seconds. */
+    long adj_nsec = (frames / (float) sampling_rate) * 1E9L;
+    ts->tv_nsec += adj_nsec;
+    while (ts->tv_nsec > 1E9L) {
+       ts->tv_sec++;
+       ts->tv_nsec -= 1E9L;
+    }
+    if (ts->tv_nsec < 0) {
+        ts->tv_sec--;
+        ts->tv_nsec += 1E9L;
+    }
+}
+
+static int get_pcm_timestamp(struct pcm* pcm, uint32_t sample_rate, struct aec_info* info, bool isOutput) {
+    int ret = 0;
+    if (pcm_get_htimestamp(pcm, &info->available, &info->timestamp) < 0) {
+        ALOGE("Error getting PCM timestamp!");
+        info->timestamp.tv_sec = 0;
+        info->timestamp.tv_nsec = 0;
+        return -EINVAL;
+    }
+    ssize_t frames;
+    if (isOutput) {
+       frames = pcm_get_buffer_size(pcm) - info->available;
+    } else {
+       frames = -info->available; /* rewind timestamp */
+    }
+    timestamp_adjust(&info->timestamp, frames, sample_rate);
+    return ret;
+}
+
 static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
                        size_t bytes)
 {
@@ -928,6 +1007,19 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
         int16_t *buf_out = (int16_t *) malloc (buf_size_out);
         int16_t *buf_in = (int16_t *) malloc (buf_size_in);
         int16_t *buf_remapped = (int16_t *) malloc (buf_size_remapped);
+	const uint64_t time_increment_nsec = (uint64_t)bytes * NANOS_PER_SECOND /
+		audio_stream_in_frame_size(stream) /
+		in_get_sample_rate(&stream->common);
+
+	if (in->timestamp_nsec == 0) {
+                  struct timespec now;
+                  clock_gettime(CLOCK_MONOTONIC, &now);
+                  const uint64_t timestamp_nsec = audio_utils_ns_from_timespec(&now);
+                  in->timestamp_nsec = timestamp_nsec;
+        } else {
+                  in->timestamp_nsec += time_increment_nsec;
+        }
+        const uint64_t time_increment_usec = time_increment_nsec / 1000;
 
         if(adev->voip_in_resampler == NULL) {
             int ret = create_resampler(bt_in_config.rate /*src rate*/, in->pcm_config->rate /*dst rate*/, in->pcm_config->channels/*dst channels*/,
@@ -953,7 +1045,7 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
         memset(buf_out, 0, buf_size_out);
 
         ret = pcm_read(in->pcm, buf_in, buf_size_in);
-
+        in->frames_read += frames_in;
 #ifdef DEBUG_PCM_DUMP
         if(sco_call_read != NULL) {
             fwrite(buf_in, 1, buf_size_in, sco_call_read);
@@ -1001,7 +1093,11 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
     } else {
         /* pcm read for primary card */
         ret = pcm_read(in->pcm, buffer, bytes);
+        in->frames_read += in->pcm_config->period_size;
 
+       struct aec_info info;
+       get_pcm_timestamp(in->pcm, in->pcm_config->rate, &info, false /*isOutput*/);
+       in->timestamp_nsec = audio_utils_ns_from_timespec(&info.timestamp);
 #ifdef DEBUG_PCM_DUMP
         if(in_read_dump != NULL) {
             fwrite(buffer, 1, bytes, in_read_dump);
@@ -1063,16 +1159,15 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
     struct pcm_params *params;
 
     int ret;
+    int temp_card = 0;
 
-    params = pcm_params_get(PCM_CARD_DEFAULT, PCM_DEVICE, PCM_OUT);
-
-    if(params != NULL) {
-       adev->card = PCM_CARD_DEFAULT;
-    } else {
-        adev->card = get_pcm_card("Dummy");
+    adev->card = GET_PCM_CARD_NUMBER(temp_card);
+    if (adev->card != -1)
+        params = pcm_params_get(adev->card, PCM_DEVICE, PCM_OUT);
+    else {
+	adev->card = get_pcm_card("Dummy");
         params = pcm_params_get(adev->card, PCM_DEVICE, PCM_OUT);
     }
-
     ALOGI("PCM playback card selected = %d, \n", adev->card);
 
     if (!params)
@@ -1326,17 +1421,16 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     struct pcm_params *params;
 
     *stream_in = NULL;
+    int temp_card = 0;
 
-    params = pcm_params_get(PCM_CARD_DEFAULT, PCM_DEVICE, PCM_IN);
-
-    if(params != NULL) {
-        adev->cardc = PCM_CARD_DEFAULT;
-    } else {
+    adev->cardc = GET_PCM_CARD_NUMBER(temp_card);
+    if (adev->card != -1)
+        params = pcm_params_get(adev->cardc, PCM_DEVICE, PCM_IN);
+    else {
         adev->cardc = get_pcm_card("Dummy");
         params = pcm_params_get(adev->cardc, PCM_DEVICE, PCM_IN);
     }
-
-    ALOGI("PCM capture card selected = %d, \n", adev->card);
+    ALOGI("PCM capture card selected = %d, \n", adev->cardc);
 
     in = (struct stream_in *)calloc(1, sizeof(struct stream_in));
     if (!in) {
@@ -1359,6 +1453,7 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     in->stream.set_gain = in_set_gain;
     in->stream.read = in_read;
     in->stream.get_input_frames_lost = in_get_input_frames_lost;
+    in->stream.get_capture_position = getCapturePosition;
 
     in->dev = adev;
     in->standby = true;
@@ -1445,7 +1540,7 @@ static int adev_open(const hw_module_t* module, const char* name,
     ALOGV("adev_open: %s", name);
 
     struct audio_device *adev;
-    int card = 0;
+    int card, temp_card = 0;
     char mixer_path[PATH_MAX];
 
     if (strcmp(name, AUDIO_HARDWARE_INTERFACE) != 0)
@@ -1478,7 +1573,10 @@ static int adev_open(const hw_module_t* module, const char* name,
     adev->hw_device.dump = adev_dump;
     adev->hw_device.get_microphones = adev_get_microphones;
 
-    snprintf(mixer_path,PATH_MAX,"/vendor/etc/mixer_paths_%d.xml", card);
+    card = GET_PCM_CARD_NUMBER(temp_card);
+    if ( card == -1)
+        card = get_pcm_card("Dummy");
+    snprintf(mixer_path,PATH_MAX,"/vendor/etc/mixer_paths_0.xml");
     adev->ar = audio_route_init(card, mixer_path);
     if (!adev->ar) {
         ALOGE("%s: Failed to init audio route controls for card %d, aborting.",
