@@ -167,7 +167,7 @@ static int get_card_number_by_name(const char* name)
 
     written = readlink(id_filepath, number_filepath, sizeof(number_filepath));
     if (written < 0) {
-        ALOGE("Sound card PCH does not exist - checking for sofhdadsp sound card");
+        ALOGE("Sound card PCH/Generic does not exist - checking for sofhdadsp sound card");
         snprintf(id_filepath, sizeof(id_filepath), "/proc/asound/%s", "sofhdadsp");
         written = readlink(id_filepath, number_filepath, sizeof(number_filepath));
         if (written < 0) {
@@ -276,7 +276,9 @@ static int start_output_stream(struct stream_out *out)
     /*TODO - this needs to be updated once the device connect intent sends
       card, device id*/
     adev->card = get_card_number_by_name("PCH");
-   
+    if (adev->card == -1) {
+    adev->card = get_card_number_by_name("Generic"); 
+    }
     
     ALOGD("%s: HDMI card number = %d, device = %d",__func__,adev->card,adev->device);
     out->pcm = pcm_open(adev->card, adev->device, PCM_OUT, &out->pcm_config);
@@ -440,6 +442,9 @@ static int parse_hdmi_device_number()
 
     ALOGV("%s enter",__func__);
     card = get_card_number_by_name("PCH"); 
+    if (card == -1){
+        card = get_card_number_by_name("Generic"); 
+    }
     mixer = mixer_open(card);
     if (mixer == NULL) {
         ALOGE(" Failed to open mixer\n");
@@ -491,6 +496,9 @@ static int parse_channel_map()
     enable_multi = property_get_bool("vendor.audio.hdmi_multichannel", false);
 
     card = get_card_number_by_name("PCH");
+    if (card == -1){
+        card = get_card_number_by_name("Generic"); 
+    }
     mixer = mixer_open(card);
     if (!mixer) {
         ALOGE("[EDID] Failed to open mixer\n");

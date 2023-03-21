@@ -46,9 +46,11 @@
 #include <audio_utils/resampler.h>
 #include <audio_route/audio_route.h>
 
-#define GET_PCM_CARD_NUMBER(temp_card)  (((temp_card = get_pcm_card("PCH"))!=-1? temp_card:\
-    ((temp_card = get_pcm_card("Intel"))!=-1? temp_card:\
-    (temp_card = get_pcm_card("sofhdadsp")))))
+#define GET_PCM_CARD_NUMBER(temp_card)  \
+    ((((temp_card = get_pcm_card("Generic_1"))!=-1? temp_card:\
+        (((temp_card = get_pcm_card("PCH"))!=-1? temp_card:\
+            ((temp_card = get_pcm_card("Intel"))!=-1? temp_card:\
+                (temp_card = get_pcm_card("sofhdadsp"))))))))
 
 #define PCM_CARD 0
 #define PCM_CARD_DEFAULT 0
