@@ -162,6 +162,12 @@ static int get_card_number_by_name(const char* name)
     char id_filepath[PATH_MAX] = {0};
     char number_filepath[PATH_MAX] = {0};
     ssize_t written;
+    char prop[PROPERTY_VALUE_MAX];
+    property_get("persist.hal.audio.hdmi.device", prop, "none");
+    if (prop != "none") {
+        ALOGV("Manually set HDMI card as %s", prop);
+        strcpy(prop, name);
+    }
 
     snprintf(id_filepath, sizeof(id_filepath), "/proc/asound/%s", name);
 
@@ -183,6 +189,13 @@ static int get_card_number_by_name(const char* name)
     // buffer is null-terminated.  So this call is safe.
     // 4 == strlen("card")
     return atoi(number_filepath + 4);
+}
+
+static int get_card_output_by_prop()
+{
+    int num = property_get_int32("persist.hal.audio.hdmi.out", 3);
+    ALOGV("Manually set HDMI output as %d", num);
+    return num;
 }
 
 static enum pcm_format Get_SinkSupported_format()
@@ -244,7 +257,11 @@ static int start_output_stream(struct stream_out *out)
         /*this will be updated once the hot plug intent
           sends these information.*/
         adev->card = DEFAULT_CARD; 
-        adev->device = parse_hdmi_device_number();
+        adev->device = get_card_output_by_prop();
+        if (adev->device < 0) {
+            ALOGV ("No custom output specified, parsing the device number automatically");
+            adev->device = parse_hdmi_device_number();
+        }
         if (adev->device < 0) {
             ALOGE ("%s : Error while parsing the mixer controls, assigning the default device", __func__);
             adev->device = DEFAULT_DEVICE;
@@ -275,8 +292,11 @@ static int start_output_stream(struct stream_out *out)
 
     /*TODO - this needs to be updated once the device connect intent sends
       card, device id*/
-    adev->card = get_card_number_by_name("PCH");
-    if (adev->card == -1) {
+    adev->card = get_card_number_by_name("PCH"); 
+    if (adev->card < 0) {
+    adev->card = get_card_number_by_name("HDMI"); 
+    }
+    if (adev->card < 0) {
     adev->card = get_card_number_by_name("Generic"); 
     }
     
@@ -441,10 +461,17 @@ static int parse_hdmi_device_number()
     bool device_status;
 
     ALOGV("%s enter",__func__);
-    card = get_card_number_by_name("PCH"); 
-    if (card == -1){
+    card = get_card_number_by_name("PCH");
+    if (card < 0){
+        card = get_card_number_by_name("HDMI");
+    }
+    if (card < 0){
         card = get_card_number_by_name("Generic"); 
     }
+    if (card < 0){
+        card = DEFAULT_CARD; 
+    }
+
     mixer = mixer_open(card);
     if (mixer == NULL) {
         ALOGE(" Failed to open mixer\n");
@@ -496,9 +523,16 @@ static int parse_channel_map()
     enable_multi = property_get_bool("vendor.audio.hdmi_multichannel", false);
 
     card = get_card_number_by_name("PCH");
-    if (card == -1){
+    if (card < 0){
+        card = get_card_number_by_name("HDMI");
+    }
+    if (card < 0){
         card = get_card_number_by_name("Generic"); 
     }
+    if (card < 0){
+        card = DEFAULT_CARD;
+    }
+
     mixer = mixer_open(card);
     if (!mixer) {
         ALOGE("[EDID] Failed to open mixer\n");
