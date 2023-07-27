@@ -20,6 +20,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -46,9 +47,6 @@
 #include <audio_utils/resampler.h>
 #include <audio_route/audio_route.h>
 
-#define GET_PCM_CARD_NUMBER(temp_card)  (((temp_card = get_pcm_card("PCH"))!=-1? temp_card:\
-    ((temp_card = get_pcm_card("Intel"))!=-1? temp_card:\
-    (temp_card = get_pcm_card("sofhdadsp")))))
 
 #define PCM_CARD 0
 #define PCM_CARD_DEFAULT 0
@@ -268,7 +266,49 @@ static void do_in_standby(struct stream_in *in)
     }
 }
 
+// Start some I/O routing function working....
+
+// Parse card number based on given name
 static int get_pcm_card(const char* name)
+{
+        char id_filepath[PATH_MAX] = {0};
+        char number_filepath[PATH_MAX] = {0};
+        ssize_t written;
+        DIR *dir;
+        struct dirent *ent;
+        int found = 0;
+
+        dir = opendir("/proc/asound");
+        if (dir != NULL) {
+            while ((ent = readdir(dir)) != NULL) {
+                if (fnmatch(name, ent->d_name, 0) == 0) {
+                    snprintf(id_filepath, sizeof(id_filepath), "/proc/asound/%s", ent->d_name);
+                    found = 1;
+                    break;
+                }
+            }
+            closedir(dir);
+        }
+
+        if (!found) {
+            ALOGE("Sound card %s does not exist\n", name);
+            return -1;
+        }
+
+        written = readlink(id_filepath, number_filepath, sizeof(number_filepath));
+        if (written < 0) {
+            ALOGE("Sound card %s does not exist\n", name);
+            return -1;
+        } else if (written >= (ssize_t)sizeof(id_filepath)) {
+            ALOGE("Sound card %s name is too long - setting default \n", name);
+            return -1;
+        }
+        ALOGI("Sound card %s exists\n", name);
+        return atoi(number_filepath + 4);
+}
+
+// Parse card number based on given name, for Bluetooth HFP driver
+static int get_pcm_card_bt(const char* name)
 {
         char id_filepath[PATH_MAX] = {0};
         char number_filepath[PATH_MAX] = {0};
@@ -288,8 +328,105 @@ static int get_pcm_card(const char* name)
         return atoi(number_filepath + 4);
 }
 
+//Manually set card output for parsing
+static int get_card_output_by_prop()
+{
+    char name[PROPERTY_VALUE_MAX];
+    int set = property_get("persist.audio.primary.card", name, "none");
+    int num = get_pcm_card(name);
+    if (num < 0)
+    {ALOGI("No manual card is being set, continue searching."); }
+    else {
+    ALOGI("Set primary output card as %s", name); }
+
+    return num;
+}
+
+//Manually set card input for parsing
+static int get_card_input_by_prop()
+{
+    char name[PROPERTY_VALUE_MAX];
+    int set = property_get("persist.audio.primary.card.in", name, "none");
+    int num = get_pcm_card(name);
+    if (num < 0)
+    {ALOGI("No manual card is being set for input."); }
+    else {
+    ALOGI("Set primary input card as %s", name); }
+
+    return num;
+}
+
+//Manually set device output
+static int get_device_output_by_prop()
+{
+    int num = property_get_int64("persist.audio.primary.device_out", PCM_DEVICE);
+    ALOGI("Set primary output device as %d", num);
+    return num;
+}
+
+//Manually set device input
+static int get_device_input_by_prop()
+{
+    int num = property_get_int64("persist.audio.primary.device_in", PCM_DEVICE);
+    ALOGI("Set primary input device as %d", num);
+    return num;
+}
+
+//choose the output based on what we set
+static int chosen_output()
+{
+//check for manual card value first if it's being set
+    int out = get_card_output_by_prop();
+    if (out < 0)
+	    { out = property_get_int64("persist.audio.primary.card_num", -1); }
+    if (out < 0)
+        { out = get_pcm_card("PCH"); }
+//Generic_1 first for newer AMD, then Generic
+    if (out < 0)
+	    { out = get_pcm_card("Generic_1"); }
+    if (out < 0)
+	    { out = get_pcm_card("Generic"); }
+//back to whatever Intel set, including SOF audio
+    if (out < 0)
+        { out = get_pcm_card("*ICH*"); }
+    if (out < 0)
+	    { out = get_pcm_card("Intel"); }
+    if (out < 0)
+	    { out = get_pcm_card("sofhdadsp"); }
+    if (out < 0)
+	    { out = get_pcm_card("Dummy"); }
+//use wildcard for cards that are on SoC
+    if (out < 0)
+	    { out = get_pcm_card("*bytcr*"); }
+    if (out < 0)
+	    { out = get_pcm_card("*bytcht*"); }
+    if (out < 0)
+	    { out = get_pcm_card("*chtmax*"); }
+    if (out < 0)
+	    { out = get_pcm_card("*chtcx*"); }
+    if (out < 0)
+	    { out = get_pcm_card("*chtrt*"); }
+//if no options found or no custom props specified, fallback to default device (pcmC0)
+    if (out < 0)
+        { out = PCM_CARD_DEFAULT; }
+    return out;
+}
+
+//choose the input based on what we set
+//If the input is not set manually
+//then set it the same as output
+static int chosen_input()
+{
+    int in = get_card_input_by_prop();
+    if (in < 0)
+    { in = property_get_int64("persist.audio.primary.card_num.in", -1); }
+    if (in < 0)
+    { in = chosen_output(); }
+    return in;
+}
+
 void update_bt_card(struct audio_device *adev){
-    adev->bt_card = get_pcm_card(AUDIO_BT_DRIVER_NAME); //update driver name if changed from BT side.
+    adev->bt_card = get_pcm_card_bt(AUDIO_BT_DRIVER_NAME); //update driver name if changed from BT side.
 }
 
 static unsigned int round_to_16_mult(unsigned int size)
@@ -321,7 +458,7 @@ static int start_output_stream(struct stream_out *out)
 //BT SCO VoIP Call]
     } else {
         ALOGI("PCM playback card selected = %d, \n", adev->card);
-        out->pcm = pcm_open(adev->card, PCM_DEVICE, PCM_OUT | PCM_NORESTART | PCM_MONOTONIC, out->pcm_config);
+        out->pcm = pcm_open(adev->card, get_device_output_by_prop(), PCM_OUT | PCM_NORESTART | PCM_MONOTONIC, out->pcm_config);
     }
 
     if (!out->pcm) {
@@ -362,7 +499,7 @@ static int start_input_stream(struct stream_in *in)
         ALOGV("%s : config : [rate %d format %d channels %d]",__func__,
             in->pcm_config->rate, in->pcm_config->format, in->pcm_config->channels);
 
-        in->pcm = pcm_open(adev->cardc, PCM_DEVICE, PCM_IN, in->pcm_config);
+        in->pcm = pcm_open(adev->cardc, get_device_input_by_prop(), PCM_IN, in->pcm_config);
     }
 
     if (!in->pcm) {
@@ -1161,13 +1298,8 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
     int ret;
     int temp_card = 0;
 
-    adev->card = GET_PCM_CARD_NUMBER(temp_card);
-    if (adev->card != -1)
-        params = pcm_params_get(adev->card, PCM_DEVICE, PCM_OUT);
-    else {
-	adev->card = get_pcm_card("Dummy");
-        params = pcm_params_get(adev->card, PCM_DEVICE, PCM_OUT);
-    }
+    adev->card = chosen_output();
+    params = pcm_params_get(adev->card, get_device_output_by_prop(), PCM_OUT);
     ALOGI("PCM playback card selected = %d, \n", adev->card);
 
     if (!params)
@@ -1423,13 +1555,8 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     *stream_in = NULL;
     int temp_card = 0;
 
-    adev->cardc = GET_PCM_CARD_NUMBER(temp_card);
-    if (adev->card != -1)
-        params = pcm_params_get(adev->cardc, PCM_DEVICE, PCM_IN);
-    else {
-        adev->cardc = get_pcm_card("Dummy");
-        params = pcm_params_get(adev->cardc, PCM_DEVICE, PCM_IN);
-    }
+    adev->cardc = chosen_input();
+    params = pcm_params_get(adev->cardc, get_device_input_by_prop(), PCM_IN);
     ALOGI("PCM capture card selected = %d, \n", adev->cardc);
 
     in = (struct stream_in *)calloc(1, sizeof(struct stream_in));
@@ -1573,9 +1700,8 @@ static int adev_open(const hw_module_t* module, const char* name,
     adev->hw_device.dump = adev_dump;
     adev->hw_device.get_microphones = adev_get_microphones;
 
-    card = GET_PCM_CARD_NUMBER(temp_card);
-    if ( card == -1)
-        card = get_pcm_card("Dummy");
+    card = chosen_output();
+
     snprintf(mixer_path,PATH_MAX,"/vendor/etc/mixer_paths_0.xml");
     adev->ar = audio_route_init(card, mixer_path);
     if (!adev->ar) {

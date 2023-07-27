@@ -49,6 +49,8 @@
 #define LOG_TAG "tiny_hdmi_audio_hw"
 #define LOG_NDEBUG 0
 
+#include <dirent.h>
+#include <fnmatch.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -162,27 +164,87 @@ static int get_card_number_by_name(const char* name)
     char id_filepath[PATH_MAX] = {0};
     char number_filepath[PATH_MAX] = {0};
     ssize_t written;
+    DIR *dir;
+    struct dirent *ent;
+    int found = 0;
 
-    snprintf(id_filepath, sizeof(id_filepath), "/proc/asound/%s", name);
+    dir = opendir("/proc/asound");
+    if (dir != NULL) {
+        while ((ent = readdir(dir)) != NULL) {
+            if (fnmatch(name, ent->d_name, 0) == 0) {
+                snprintf(id_filepath, sizeof(id_filepath), "/proc/asound/%s", ent->d_name);
+                found = 1;
+                break;
+            }
+        }
+        closedir(dir);
+    }
+
+    if (!found) {
+        ALOGE("Sound card %s does not exist\n", name);
+        return -1;
+    }
 
     written = readlink(id_filepath, number_filepath, sizeof(number_filepath));
     if (written < 0) {
-        ALOGE("Sound card PCH does not exist - checking for sofhdadsp sound card");
-        snprintf(id_filepath, sizeof(id_filepath), "/proc/asound/%s", "sofhdadsp");
-        written = readlink(id_filepath, number_filepath, sizeof(number_filepath));
-        if (written < 0) {
-            ALOGE("Sound card %s does not exist - setting default", name);
-            return DEFAULT_CARD;
-	}
+        ALOGE("Sound card %s does not exist\n", name);
+        return -1;
     } else if (written >= (ssize_t)sizeof(id_filepath)) {
-        ALOGE("Sound card %s name is too long - setting default", name);
-        return DEFAULT_CARD;
+        ALOGE("Sound card %s name is too long - setting default \n", name);
+        return -1;
     }
+    ALOGI("Sound card %s exists\n", name);
 
     // We are assured, because of the check in the previous elseif, that this
     // buffer is null-terminated.  So this call is safe.
     // 4 == strlen("card")
     return atoi(number_filepath + 4);
+}
+
+//Manually set card output for parsing
+static int get_card_output_by_prop()
+{
+    char name[PROPERTY_VALUE_MAX];
+    int set = property_get("persist.audio.hdmi.card", name, "none");
+    int num = get_card_number_by_name(name);
+    if (num == -1)
+    {ALOGV("No manual card is being set, continue searching."); }
+    else {
+    ALOGV("Set HDMI output card as %s", name); }
+    
+    return num;
+}
+
+//Manually set device output
+static int get_device_output_by_prop()
+{
+    int num = property_get_int64("persist.audio.hdmi.device", -1);
+    ALOGV("Set HDMI output device as %d", num);
+    return num;
+}
+
+//choose the output based on what we set
+static int hdmi_chosen_output()
+{
+//check for manual card value first if it's being set
+    int out = get_card_output_by_prop();
+    if (out == -1)
+	    { out = property_get_int64("persist.audio.hdmi.card_num", -1); }
+    if (out == -1)
+        { out = get_card_number_by_name("PCH"); }
+    if (out == -1)
+	    { out = get_card_number_by_name("HDMI"); }
+    if (out == -1)
+	    { out = get_card_number_by_name("Generic"); }
+//back to whatever Intel set, including SOF audio
+    if (out == -1)
+	    { out = get_card_number_by_name("sofhdadsp"); }
+    if (out == -1)
+	    { out = get_card_number_by_name("Dummy"); }
+//if no options found or no custom props specified, fallback to default device (pcmC0)
+    if (out == -1)
+        { out = DEFAULT_CARD; }
+    return out;
 }
 
 static enum pcm_format Get_SinkSupported_format()
@@ -243,7 +305,7 @@ static int start_output_stream(struct stream_out *out)
  
         /*this will be updated once the hot plug intent
           sends these information.*/
-        adev->card = DEFAULT_CARD; 
+        adev->card = DEFAULT_CARD;
         adev->device = parse_hdmi_device_number();
         if (adev->device < 0) {
             ALOGE ("%s : Error while parsing the mixer controls, assigning the default device", __func__);
@@ -275,8 +337,7 @@ static int start_output_stream(struct stream_out *out)
 
     /*TODO - this needs to be updated once the device connect intent sends
       card, device id*/
-    adev->card = get_card_number_by_name("PCH");
-   
+    adev->card = hdmi_chosen_output();
     
     ALOGD("%s: HDMI card number = %d, device = %d",__func__,adev->card,adev->device);
     out->pcm = pcm_open(adev->card, adev->device, PCM_OUT, &out->pcm_config);
@@ -438,8 +499,13 @@ static int parse_hdmi_device_number()
     unsigned int i,id,j;
     bool device_status;
 
+    int custom_dev = get_device_output_by_prop();
+    if (custom_dev != -1)
+    { return custom_dev; }
+
     ALOGV("%s enter",__func__);
-    card = get_card_number_by_name("PCH"); 
+    card = hdmi_chosen_output();
+
     mixer = mixer_open(card);
     if (mixer == NULL) {
         ALOGE(" Failed to open mixer\n");
@@ -488,9 +554,10 @@ static int parse_channel_map()
     bool enable_multi;
   
 
-    enable_multi = property_get_bool("vendor.audio.hdmi_multichannel", false);
+    enable_multi = property_get_bool("persist.audio.hdmi.multichannel", false);
 
-    card = get_card_number_by_name("PCH");
+    card = hdmi_chosen_output();
+
     mixer = mixer_open(card);
     if (!mixer) {
         ALOGE("[EDID] Failed to open mixer\n");
