@@ -22,7 +22,7 @@
 #include <fcntl.h>
 #include <fnmatch.h>
 #include <pthread.h>
-#include <stdint.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <sys/time.h>
 #include <unistd.h>
