@@ -52,7 +52,7 @@ LOCAL_PROPRIETARY_MODULE := true
 
 LOCAL_HEADER_LIBRARIES += libhardware_headers
 
-LOCAL_MODULE := audio.primary.x86
+LOCAL_MODULE := audio.primary.x86_celadon
 
 LOCAL_MODULE_RELATIVE_PATH := hw
 
