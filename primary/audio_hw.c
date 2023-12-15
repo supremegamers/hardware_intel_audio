@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "audio_hw_primary"
+#define LOG_TAG "audio_celadon_primary"
 /*#define LOG_NDEBUG 0*/
 
 #include <dirent.h>
